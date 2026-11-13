@@ -42,6 +42,10 @@ def identity(x):
     return x
 
 
+def inc(x):
+    return x + 1
+
+
 def func(*args):
     try:
         return "-".join(args)
@@ -956,6 +960,137 @@ def test_linear_fusion_multiple_outputs():
     assert isinstance(result["fourth"], Alias)
     assert isinstance(result["first-second"], Task)
     assert isinstance(result["third-fourth"], Task)
+
+
+def _two_independent_chains():
+    # Two independent linear chains with distinct inputs/outputs.
+    a1 = DataNode("a1", 1)
+    a2 = Task("a2", inc, a1.ref())
+    a3 = Task("a3", inc, a2.ref())
+    b1 = DataNode("b1", 100)
+    b2 = Task("b2", inc, b1.ref())
+    b3 = Task("b3", inc, b2.ref())
+    tasks = (a1, a2, a3, b1, b2, b3)
+    return {t.key: t for t in tasks}, a3, b3
+
+
+def test_linear_fusion_renamed_key_collision(monkeypatch):
+    """Two distinct chains must not collapse onto the same merged key.
+
+    Long merged names get truncated (see ``default_fused_keys_renamer``), so two
+    different chains can produce the same merged name. Without collision
+    protection the second chain silently overwrites the first and every alias
+    pointing at the merged key returns the wrong result.
+    """
+    import dask.optimization as optimization_mod
+
+    def colliding_fuse_keys(keys, existing_keys, key_renamer=None):
+        # Deterministically force every chain onto the same merged name.
+        if "same-fused-name" in existing_keys:
+            return keys[-1]
+        return "same-fused-name"
+
+    monkeypatch.setattr(optimization_mod, "fuse_keys", colliding_fuse_keys)
+
+    dsk, a3, b3 = _two_independent_chains()
+    result = fuse_linear_task_spec(dsk, {a3.key, b3.key})
+
+    # The first chain takes the merged name; the colliding second chain keeps
+    # its own root key instead of overwriting the first chain.
+    assert isinstance(result["same-fused-name"], Task)
+    assert isinstance(result[a3.key], Alias)
+    assert result[a3.key].target == "same-fused-name"
+    assert isinstance(result[b3.key], Task)
+    assert not isinstance(result[b3.key], Alias)
+    assert len(result) == 3
+
+    # Executing the fused graph must reproduce the unfused results exactly.
+    out = execute_graph(result, keys={a3.key, b3.key})
+    assert out == {a3.key: 3, b3.key: 102}
+
+
+def test_linear_fusion_renamed_key_collision_tuple_keys(monkeypatch):
+    """Collision protection also applies to tuple keys as used by arrays."""
+    import dask.optimization as optimization_mod
+
+    a1 = DataNode(("a", 0), 1)
+    a2 = Task(("a", 1), inc, a1.ref())
+    b1 = DataNode(("b", 0), 100)
+    b2 = Task(("b", 1), inc, b1.ref())
+    dsk = {t.key: t for t in (a1, a2, b1, b2)}
+
+    collided = ("same-fused-name", 0)
+
+    def colliding_fuse_keys(keys, existing_keys, key_renamer=None):
+        if collided in existing_keys:
+            return keys[-1]
+        return collided
+
+    monkeypatch.setattr(optimization_mod, "fuse_keys", colliding_fuse_keys)
+
+    result = fuse_linear_task_spec(dsk, {a2.key, b2.key})
+    assert isinstance(result[collided], Task)
+    assert isinstance(result[a2.key], Alias)
+    # The colliding second chain falls back to its own root tuple key.
+    assert isinstance(result[b2.key], Task)
+    assert not isinstance(result[b2.key], Alias)
+
+    out = execute_graph(result, keys={a2.key, b2.key})
+    assert out == {a2.key: 2, b2.key: 101}
+
+
+def test_linear_fusion_results_match_unfused():
+    """Fusion must leave computed values identical to the unfused graph."""
+    dsk, a3, b3 = _two_independent_chains()
+    fused = fuse_linear_task_spec(dsk, {a3.key, b3.key})
+    out_fused = execute_graph(fused, keys={a3.key, b3.key})
+    out_unfused = execute_graph(dict(dsk), keys={a3.key, b3.key})
+    assert out_fused == out_unfused == {a3.key: 3, b3.key: 102}
+
+
+def test_linear_fusion_truncated_renamed_keys_stay_unique(monkeypatch):
+    """Fusion stays correct when the renamer truncates long merged names.
+
+    Uses long key names together with a small length limit so the merged name
+    goes through the truncation branch of ``default_fused_keys_renamer``. The
+    fused graph must still compute the unfused results exactly.
+    """
+    import dask.optimization as optimization_mod
+    from dask.optimization import default_fused_keys_renamer
+
+    common = "x" * 110
+    a1 = DataNode(f"{common}-a1", 1)
+    a2 = Task(f"{common}-a2", inc, a1.ref())
+    a3 = Task(f"{common}-a3", inc, a2.ref())
+    b1 = DataNode(f"{common}-b1", 100)
+    b2 = Task(f"{common}-b2", inc, b1.ref())
+    b3 = Task(f"{common}-b3", inc, b2.ref())
+    dsk = {t.key: t for t in (a1, a2, a3, b1, b2, b3)}
+
+    def short_renamer(keys, max_fused_key_length=120):
+        return default_fused_keys_renamer(keys, max_fused_key_length=20)
+
+    original_fuse_keys = optimization_mod.fuse_keys
+
+    def truncating_fuse_keys(keys, existing_keys, key_renamer=None):
+        return original_fuse_keys(keys, existing_keys, short_renamer)
+
+    monkeypatch.setattr(optimization_mod, "fuse_keys", truncating_fuse_keys)
+
+    result = fuse_linear_task_spec(dsk, {a3.key, b3.key})
+    # The fused tasks carry truncated merged names; the root-key aliases keep
+    # their original (long) names by design.
+    fused_task_names = [
+        k if isinstance(k, str) else k[0]
+        for k, v in result.items()
+        if isinstance(v, Task)
+    ]
+    assert fused_task_names and all(
+        len(name) <= 20 for name in fused_task_names
+    )
+    assert len(result) == len(set(result))
+    out = execute_graph(result, keys={a3.key, b3.key})
+    assert out == {a3.key: 3, b3.key: 102}
 
 
 def test_nested_containers():

@@ -443,6 +443,46 @@ def default_fused_keys_renamer(keys, max_fused_key_length=120):
         return (_enforce_max_key_limit(concatenated_name),) + first_key[1:]
 
 
+def fuse_keys(keys, existing_keys, key_renamer=default_fused_keys_renamer):
+    """Compute a collision-free key for a set of fused tasks.
+
+    This centralizes the renaming semantics shared by the legacy graph
+    fusion (:func:`fuse`) and the task-spec fusion
+    (:func:`dask._task_spec.fuse_linear_task_spec`).
+
+    ``key_renamer`` builds the descriptive merged key. When the merged key is
+    truncated (see ``max_fused_key_length`` in
+    :func:`default_fused_keys_renamer`) two distinct chains can end up with the
+    same merged name. Writing both chains under that name would silently let the
+    second one overwrite the first and produce wrong results.
+
+    On a collision with any key already present in ``existing_keys`` the rename
+    is discarded and the chain's own root key (the last entry of ``keys``) is
+    returned instead, leaving the fused task reachable under its original key.
+
+    Parameters
+    ----------
+    keys : sequence
+        The keys that are fused together, ordered from the leaves towards the
+        root; the last entry is the root key of the fused chain.
+    existing_keys : collection
+        Keys already present in the graph that is being built.
+    key_renamer : callable, optional
+        Function producing the candidate merged key from ``keys``.
+
+    Returns
+    -------
+    The collision-free key under which the fused task should be stored.
+    """
+    root_key = keys[-1]
+    if key_renamer is None:
+        return root_key
+    alias = key_renamer(list(keys))
+    if alias is None or alias == root_key or alias in existing_keys:
+        return root_key
+    return alias
+
+
 # PEP-484 compliant singleton constant
 # https://www.python.org/dev/peps/pep-0484/#support-for-singleton-types-in-unions
 class Default(Enum):
@@ -878,8 +918,8 @@ def fuse(
 
     if key_renamer:
         for root_key, fused_keys in fused_trees.items():
-            alias = key_renamer(fused_keys)
-            if alias is not None and alias not in rv:
+            alias = fuse_keys(fused_keys, rv, key_renamer)
+            if alias != root_key:
                 rv[alias] = rv[root_key]
                 rv[root_key] = alias
                 deps[alias] = deps[root_key]

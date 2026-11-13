@@ -11,6 +11,7 @@ from dask.optimization import (
     cull,
     functions_of,
     fuse,
+    fuse_keys,
     fuse_linear,
     inline,
     inline_functions,
@@ -1188,6 +1189,64 @@ def test_fused_keys_max_length():  # generic fix for gh-5999
     fused, deps = fuse(d, rename_keys=True)
     for key in fused:
         assert len(key) < 150
+
+
+def test_fuse_keys_returns_merged_name_when_free():
+    keys = ["a", "b", "c"]
+    assert fuse_keys(keys, existing_keys={"other"}) == "a-b-c"
+    # tuple keys keep the root key's trailing components
+    assert fuse_keys([("a", 0), ("b", 0)], existing_keys=set()) == (
+        "a-b",
+        0,
+    )
+
+
+def test_fuse_keys_falls_back_on_collision():
+    keys = ["a", "b", "c"]
+    # The candidate merged name is already taken by another chain.
+    assert fuse_keys(keys, existing_keys={"a-b-c"}) == "c"
+    assert fuse_keys(
+        [("a", 0), ("b", 0)], existing_keys={("a-b", 0)}
+    ) == ("b", 0)
+
+
+def test_fuse_keys_renamer_returning_root_or_none():
+    keys = ["a", "b", "c"]
+    # Renamer yielding the root key itself -> no rename needed.
+    assert fuse_keys(keys, existing_keys=set(), key_renamer=lambda ks: "c") == "c"
+    # Renamer yielding None -> keep root key.
+    assert fuse_keys(keys, existing_keys=set(), key_renamer=lambda ks: None) == "c"
+    # No renamer at all -> keep root key.
+    assert fuse_keys(keys, existing_keys=set(), key_renamer=None) == "c"
+
+
+def test_fuse_collision_keeps_both_chains():
+    """Legacy ``fuse`` must keep both chains computable when names collide.
+
+    A custom renamer forces both chains onto one merged name. This guards the
+    no-regression behavior of the unified :func:`fuse_keys` helper on the legacy
+    tuple-graph path; the genuinely destructive silent overwrite lived in the
+    task-spec path and is covered in ``test_task_spec.py``.
+    """
+
+    def colliding_renamer(keys, max_fused_key_length=120):
+        return "same-fused-name"
+
+    d = {
+        "a1": 1,
+        "a2": (inc, "a1"),
+        "a3": (inc, "a2"),
+        "b1": 100,
+        "b2": (inc, "b1"),
+        "b3": (inc, "b2"),
+    }
+    fused, _ = fuse(d, keys={"a3", "b3"}, rename_keys=colliding_renamer)
+
+    # One chain takes the merged name; the colliding chain's root keeps its
+    # fused task directly. Both requested outputs remain correct.
+    assert "same-fused-name" in fused
+    assert any(isinstance(fused[r], tuple) for r in ("a3", "b3"))
+    assert tuple(dask.get(fused, ["a3", "b3"])) == (3, 102)
 
 
 def func(*args):

@@ -1108,7 +1108,7 @@ def fuse_linear_task_spec(dsk, keys):
     can't fuse those together.
     """
     from dask.core import reverse_dict
-    from dask.optimization import default_fused_keys_renamer
+    from dask.optimization import fuse_keys
 
     keys = set(keys)
     dependencies = DependenciesMapping(dsk)
@@ -1176,8 +1176,13 @@ def fuse_linear_task_spec(dsk, keys):
         if len(linear_chain) == 1:
             result[top_key] = linear_chain[0]
         else:
-            # Renaming the keys is necessary to preserve the rootish detection for now
-            renamed_key = default_fused_keys_renamer([tsk.key for tsk in linear_chain])
+            # Renaming the keys is necessary to preserve the rootish detection for now.
+            # ``fuse_keys`` guards against two distinct chains collapsing onto the
+            # same merged name (e.g. when the merged name is truncated). On a
+            # collision the fused task keeps its root key instead of silently
+            # overwriting another chain, matching the behavior of ``fuse``.
+            chain_keys = [tsk.key for tsk in linear_chain]
+            renamed_key = fuse_keys(chain_keys, result)
             result[renamed_key] = Task.fuse(*linear_chain, key=renamed_key)
             if renamed_key != top_key:
                 # Having the same prefixes can result in the same key, i.e. getitem-hash -> getitem-hash
